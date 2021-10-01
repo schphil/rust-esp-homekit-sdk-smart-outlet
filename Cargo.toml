@@ -39,13 +39,17 @@ esp-idf-sys = "0.19"
 embedded-svc = "0.8.3"
 esp-idf-svc = { version = "0.19", features = ["binstart"] }
 esp-idf-hal = "0.19"
-embedded-hal = "0.2"
+esp32-hal = {version = "0.3.0", features = ["alloc", "mem", "rt"]}
 embedded-graphics = "0.7"
 display-interface = "0.4"
 display-interface-spi = "0.4"
 st7789 = "0.6"
 ili9341 = { version = "0.5", git = "https://github.com/ivmarkov/ili9341-rs" }
 ssd1306 = "0.7"
+lazy_static = "1.4.0"
+
+#esp-homekit-sdk-sys = {git = "https://github.com/schphil/esp-homekit-sdk-sys.git"}
+esp-homekit-sdk-sys = {path = "/Users/philippscheff/privat/code/esp-homekit-sdk-sys"}
 
 #backtrace = { version = "0.3.56", path = "../backtrace-rs" }
 #backtrace = { version = "0.3.56", git = "https://github.com/ivmarkov/backtrace-rs.git", branch = "esp-idf" }

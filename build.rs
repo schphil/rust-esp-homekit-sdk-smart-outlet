@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 // Necessary because of this issue: https://github.com/rust-lang/cargo/issues/9641
 fn main() -> anyhow::Result<()> {
-    embuild::kconfig::CfgArgs::output_propagated("ESP_IDF")?;
-    embuild::build::LinkArgs::output_propagated("ESP_IDF")?;
+    embuild::kconfig::CfgArgs::output_propagated("ESP_HOMEKIT_SDK")?;
+    embuild::build::LinkArgs::output_propagated("ESP_HOMEKIT_SDK")?;
 
     let mcu = std::env::var("DEP_ESP_IDF_MCU").map_err(|s| anyhow::anyhow!(s))?;
 
@@ -17,7 +17,9 @@ fn main() -> anyhow::Result<()> {
 
         embuild::cargo::track_file(ulp_elf);
     }
-
+    
+    ////println!("cargo:rustc-link-arg=/Users/philippscheff/privat/code/rust-esp32-std-homekit-smart-outlet/target/xtensa-esp32-espidf/debug/build/esp-homekit-sdk-sys-17c62df7f0a677c9/out/esp-homekit-sdk/.pio/build/debug/libf3d/libesp-homekit-sdk.a");
+    
     println!("cargo:rustc-cfg={}", mcu);
 
     Ok(())

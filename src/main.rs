@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
+#![feature(const_mut_refs)]
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Condvar, Mutex};
@@ -10,6 +11,8 @@ use anyhow::*;
 use log::*;
 
 use url;
+
+use core::ptr;
 
 use embedded_svc::anyerror::*;
 use embedded_svc::httpd::registry::*;
@@ -35,74 +38,113 @@ use esp_idf_hal::ulp;
 use esp_idf_sys;
 use esp_idf_sys::esp;
 
+use esp_homekit_sdk_sys::*;
+
+use esp32_hal::prelude::*;
+
+use esp32_hal::clock_control::{sleep, CPUSource::PLL, ClockControl};
+use esp32_hal::dport::Split;
+use esp32_hal::dprintln;
+use esp32_hal::interrupt::{clear_software_interrupt, Interrupt, InterruptLevel};
+use esp32_hal::serial::{config::Config, Serial};
+use esp32_hal::target;
+use esp32_hal::Core::PRO;
+use esp32_hal::*;
+
 use display_interface_spi::SPIInterfaceNoCS;
 
-use embedded_graphics::mono_font::{ascii::FONT_10X20, MonoTextStyle};
-use embedded_graphics::pixelcolor::*;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::*;
-use embedded_graphics::text::*;
+use core::cell;
 
-use ili9341;
-use ssd1306;
-use ssd1306::mode::DisplayConfig;
-use st7789;
+use lazy_static::lazy_static;
 
 const SSID: &str = "ssid";
-const PASS: &str = "pass";
+const PASS: &str = "password";
 
-#[cfg(esp32s2)]
-include!(env!("EMBUILD_SYMGEN_RUNNER_SYMBOLS_FILE"));
+const SMART_OUTLET_TASK_NAME: &str = "hap_outlet";
+const SMART_OUTLET_TASK_STACKSIZE: u32 = 40000;
+const SMART_OUTLET_TASK_PRIORITY: UBaseType_t = 1;
 
-#[cfg(esp32s2)]
-const ULP: &[u8] = include_bytes!(env!("EMBUILD_BINGEN_RUNNER_BIN_FILE"));
+static GPIO: CriticalSectionSpinLockMutex<
+    Option<esp_idf_hal::gpio::Gpio26<esp_idf_hal::gpio::Output>>,
+> = CriticalSectionSpinLockMutex::new(None);
 
 fn main() -> Result<()> {
-    test_print();
-
     test_atomics();
 
     test_threads();
 
-    // Enough playing.
-    // The real demo: start WiFi and ignite Httpd
+    let task = smart_outlet_handler;
 
+    task::Task::create(
+        task,
+        SMART_OUTLET_TASK_NAME,
+        SMART_OUTLET_TASK_STACKSIZE,
+        SMART_OUTLET_TASK_PRIORITY,
+    );
+
+    Ok(())
+}
+
+fn smart_outlet_handler(cv: *mut esp_homekit_sdk_sys::c_types::c_void) {
     env::set_var("RUST_BACKTRACE", "1"); // Get some nice backtraces from Anyhow
 
-    // Uncomment this if you have a TTGO ESP32 board
-    // For other boards, you might have to use a different embedded-graphics driver and pin configuration
-    // ttgo_hello_world()?;
+    let mut wifi = wifi();
 
-    // ... or uncomment this if you have a Kaluga-1 ESP32-S2 board
-    // For other boards, you might have to use a different embedded-graphics driver and pin configuration
-    // #[cfg(esp32s2)]
-    // kaluga_hello_world(true)?;
+    //let mutex = Arc::new((Mutex::new(None), Condvar::new()));
+    //let httpd = httpd(mutex.clone());
 
-    // ... or uncomment this if you have a Heltec LoRa 32 board
-    // For other boards, you might have to use a different embedded-graphics driver and pin configuration
-    // heltec_hello_world()?;
+    let peripherals = Peripherals::take().unwrap();
+    let pins = peripherals.pins;
+    let mut switch = pins.gpio26.into_output().unwrap();
+    switch.set_low();
 
-    let mut wifi = wifi()?;
+    use esp32_hal::gpio::Mutex;
+    (&GPIO).lock(|val| *val = Some(switch));
 
-    test_tcp()?;
-
-    #[cfg(esp_idf_config_lwip_ipv4_napt)]
-    test_napt(&mut wifi)?;
-
-    let mutex = Arc::new((Mutex::new(None), Condvar::new()));
-
-    let httpd = httpd(mutex.clone())?;
-
-    let mut wait = mutex.0.lock().unwrap();
-
-    #[allow(unused)]
-    let cycles = loop {
-        if let Some(cycles) = *wait {
-            break cycles;
-        } else {
-            wait = mutex.1.wait(wait).unwrap();
-        }
+    let hap_config = hap::Config {
+        name: CString::new("Smart-Outlet").unwrap(),
+        model: CString::new("Esp32").unwrap(),
+        manufacturer: CString::new("Espressif").unwrap(),
+        serial_num: CString::new("111122334455").unwrap(),
+        fw_rev: CString::new("1.0.0").unwrap(),
+        hw_rev: CString::new("0.1.0").unwrap(),
+        pv: CString::new("1.1.0").unwrap(),
+        cid: accessory::Category::OUTLET,
     };
+
+    hap::init();
+
+    let mut accessory = accessory::create(&hap_config);
+    let mut service = service::create();
+
+    service::add_name(service, "My Smart Outlet");
+
+    let outlet_in_use = service::get_service_by_uuid(service);
+
+    service::set_write_cb(service, Some(outlet_write));
+
+    hap::add_service_to_accessory(accessory, service);
+
+    hap::add_accessory(accessory);
+
+    let setup_code = CString::new("111-22-333").unwrap();
+    let setup_id = CString::new("ES32").unwrap();
+
+    hap::secret(setup_code, setup_id);
+
+    hap::start();
+
+    //let mut wait = mutex.0.lock().unwrap();
+
+    loop {}
+    //     #[allow(unused)]
+    //     let cycles = loop {
+    //         if let Some(cycles) = *wait {
+    //             break cycles;
+    //         } else {
+    //             wait = mutex.1.wait(wait).unwrap();
+    //         }
+    //     };
 
     for s in 0..3 {
         info!("Shutting down in {} secs", 3 - s);
@@ -114,23 +156,31 @@ fn main() -> Result<()> {
 
     drop(wifi);
     info!("Wifi stopped");
-
-    #[cfg(esp32s2)]
-    start_ulp(cycles)?;
-
-    Ok(())
 }
 
-fn test_print() {
-    // Start simple
-    println!("Hello, world from Rust!");
+unsafe extern "C" fn outlet_write(
+    write_data: *mut esp_homekit_sdk_sys::hap_write_data_t,
+    count: i32,
+    serv_priv: *mut esp_homekit_sdk_sys::c_types::c_void,
+    write_priv: *mut esp_homekit_sdk_sys::c_types::c_void,
+) -> i32 {
+    use esp32_hal::gpio::Mutex;
 
-    // Check collections
-    let mut children = vec![];
+    let mut gpio = &GPIO;
 
-    children.push("foo");
-    children.push("bar");
-    println!("More complex print {:?}", children);
+    if (*write_data).val.b == true {
+        gpio.lock(|gpio| {
+            let gpio = gpio.as_mut().unwrap();
+            gpio.set_high();
+        })
+    } else {
+        gpio.lock(|gpio| {
+            let gpio = gpio.as_mut().unwrap();
+            gpio.set_low();
+        })
+    }
+
+    hap::HAP_SUCCESS_
 }
 
 fn test_threads() {
@@ -159,32 +209,6 @@ fn test_threads() {
     println!("Joins were successful.");
 }
 
-fn test_tcp() -> Result<()> {
-    info!("About to open a TCP connection to 1.1.1.1 port 80");
-
-    let mut stream = TcpStream::connect("one.one.one.one:80")?;
-
-    let err = stream.try_clone();
-    if let Err(err) = err {
-        info!(
-            "Duplication of file descriptors does not work (yet) on the ESP-IDF, as expected: {}",
-            err
-        );
-    }
-
-    stream.write("GET / HTTP/1.0\n\n".as_bytes())?;
-
-    let mut result = Vec::new();
-
-    stream.read_to_end(&mut result)?;
-
-    info!(
-        "1.1.1.1 returned:\n=================\n{}\n=================\nSince it returned something, all is OK",
-        std::str::from_utf8(&result)?);
-
-    Ok(())
-}
-
 #[allow(deprecated)]
 fn test_atomics() {
     let a = AtomicUsize::new(0);
@@ -202,191 +226,6 @@ fn test_atomics() {
     println!("Result: {}, {}", r1, r2);
 }
 
-#[allow(dead_code)]
-#[cfg(esp32)]
-fn ttgo_hello_world() -> Result<()> {
-    info!("About to initialize the TTGO ST7789 LED driver");
-
-    let peripherals = Peripherals::take().unwrap();
-    let pins = peripherals.pins;
-
-    let config = <spi::config::Config as Default>::default()
-        .baudrate(26.MHz().into())
-        .bit_order(spi::config::BitOrder::MSBFirst);
-
-    let mut backlight = pins.gpio4.into_output()?;
-    backlight.set_high()?;
-
-    let di = SPIInterfaceNoCS::new(
-        spi::Master::<spi::SPI2, _, _, _, _>::new(
-            peripherals.spi2,
-            spi::Pins {
-                sclk: pins.gpio18,
-                sdo: pins.gpio19,
-                sdi: Option::<gpio::Gpio21<gpio::Unknown>>::None,
-                cs: Some(pins.gpio5),
-            },
-            config,
-        )?,
-        pins.gpio16.into_output()?,
-    );
-
-    let mut display = st7789::ST7789::new(
-        di,
-        pins.gpio23.into_output()?,
-        // SP7789V is designed to drive 240x320 screens, even though the TTGO physical screen is smaller
-        240,
-        320,
-    );
-
-    AnyError::<st7789::Error<_>>::wrap(|| {
-        display.init(&mut delay::Ets)?;
-        display.set_orientation(st7789::Orientation::Portrait)?;
-
-        // The TTGO board's screen does not start at offset 0x0, and the physical size is 135x240, instead of 240x320
-        let top_left = Point::new(52, 40);
-        let size = Size::new(135, 240);
-
-        led_draw(&mut display.cropped(&Rectangle::new(top_left, size)))
-    })
-}
-
-#[allow(dead_code)]
-#[cfg(esp32s2)]
-fn kaluga_hello_world(ili9341: bool) -> Result<()> {
-    info!(
-        "About to initialize the Kaluga {} SPI LED driver",
-        if ili9341 { "ILI9341" } else { "ST7789" }
-    );
-
-    let peripherals = Peripherals::take().unwrap();
-    let pins = peripherals.pins;
-
-    let config = <spi::config::Config as Default>::default()
-        .baudrate((if ili9341 { 40 } else { 80 }).MHz().into())
-        .bit_order(spi::config::BitOrder::MSBFirst);
-
-    let mut backlight = pins.gpio6.into_output()?;
-    backlight.set_high()?;
-
-    let di = SPIInterfaceNoCS::new(
-        spi::Master::<spi::SPI3, _, _, _, _>::new(
-            peripherals.spi3,
-            spi::Pins {
-                sclk: pins.gpio15,
-                sdo: pins.gpio9,
-                sdi: Option::<gpio::Gpio21<gpio::Unknown>>::None,
-                cs: Some(pins.gpio11),
-            },
-            config,
-        )?,
-        pins.gpio13.into_output()?,
-    );
-
-    let reset = pins.gpio16.into_output()?;
-
-    if ili9341 {
-        AnyError::<ili9341::DisplayError>::wrap(|| {
-            let mut display = ili9341::Ili9341::new(
-                di,
-                reset,
-                &mut delay::Ets,
-                KalugaOrientation::Landscape,
-                ili9341::DisplaySize240x320,
-            )?;
-
-            led_draw(&mut display)
-        })
-    } else {
-        let mut display = st7789::ST7789::new(di, reset, 320, 240);
-
-        AnyError::<st7789::Error<_>>::wrap(|| {
-            display.init(&mut delay::Ets)?;
-            display.set_orientation(st7789::Orientation::Landscape)?;
-
-            led_draw(&mut display)
-        })
-    }
-}
-
-#[allow(dead_code)]
-#[cfg(esp32)]
-fn heltec_hello_world() -> Result<()> {
-    info!("About to initialize the Heltec SSD1306 I2C LED driver");
-
-    let peripherals = Peripherals::take().unwrap();
-    let pins = peripherals.pins;
-
-    let config = <i2c::config::MasterConfig as Default>::default().baudrate(400.kHz().into());
-
-    let di = ssd1306::I2CDisplayInterface::new(i2c::Master::<i2c::I2C0, _, _>::new(
-        peripherals.i2c0,
-        i2c::Pins {
-            sda: pins.gpio4,
-            scl: pins.gpio15,
-        },
-        config,
-    )?);
-
-    let mut delay = delay::Ets;
-    let mut reset = pins.gpio16.into_output()?;
-
-    reset.set_high()?;
-    delay.delay_ms(1 as u32);
-
-    reset.set_low()?;
-    delay.delay_ms(10 as u32);
-
-    reset.set_high()?;
-
-    let mut display = Box::new(
-        ssd1306::Ssd1306::new(
-            di,
-            ssd1306::size::DisplaySize128x64,
-            ssd1306::rotation::DisplayRotation::Rotate0,
-        )
-        .into_buffered_graphics_mode(),
-    );
-
-    AnyError::<display_interface::DisplayError>::wrap(|| {
-        display.init()?;
-
-        led_draw(&mut *display)?;
-
-        display.flush()
-    })
-}
-
-#[allow(dead_code)]
-fn led_draw<D>(display: &mut D) -> Result<(), D::Error>
-where
-    D: DrawTarget + Dimensions,
-    D::Color: From<Rgb565>,
-{
-    display.clear(Rgb565::BLACK.into())?;
-
-    Rectangle::new(display.bounding_box().top_left, display.bounding_box().size)
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .fill_color(Rgb565::BLUE.into())
-                .stroke_color(Rgb565::YELLOW.into())
-                .stroke_width(1)
-                .build(),
-        )
-        .draw(display)?;
-
-    Text::new(
-        "Hello Rust!",
-        Point::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
-        MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE.into()),
-    )
-    .draw(display)?;
-
-    info!("LED rendering done");
-
-    Ok(())
-}
-
 #[allow(unused_variables)]
 fn httpd(mutex: Arc<(Mutex<Option<u32>>, Condvar)>) -> Result<idf::Server> {
     let server = idf::ServerRegistry::new()
@@ -402,101 +241,7 @@ fn httpd(mutex: Arc<(Mutex<Option<u32>>, Condvar)>) -> Result<idf::Server> {
                 .into()
         })?;
 
-    #[cfg(esp32s2)]
-    let server = httpd_ulp_endpoints(server, mutex)?;
-
     server.start(&Default::default())
-}
-
-#[cfg(esp32s2)]
-fn httpd_ulp_endpoints(
-    server: ServerRegistry,
-    mutex: Arc<(Mutex<Option<u32>>, Condvar)>,
-) -> Result<ServerRegistry> {
-    server
-        .at("/ulp")
-        .get(|_| {
-            Ok(r#"
-            <doctype html5>
-            <html>
-                <body>
-                    <form method = "post" action = "/ulp_start" enctype="application/x-www-form-urlencoded">
-                        Connect a LED to ESP32-S2 GPIO <b>Pin 04</b> and GND.<br>
-                        Blink it with ULP <input name = "cycles" type = "text" value = "10"> times
-                        <input type = "submit" value = "Go!">
-                    </form>
-                </body>
-            </html>
-            "#.into())
-        })?
-        .at("/ulp_start")
-        .post(move |mut request| {
-            let body = request.as_bytes()?;
-
-            let cycles = url::form_urlencoded::parse(&body)
-                .filter(|p| p.0 == "cycles")
-                .map(|p| str::parse::<u32>(&p.1).map_err(Error::msg))
-                .next()
-                .ok_or(anyhow!("No parameter cycles"))??;
-
-            let mut wait = mutex.0.lock().unwrap();
-
-            *wait = Some(cycles);
-            mutex.1.notify_one();
-
-            Ok(format!(
-                r#"
-                <doctype html5>
-                <html>
-                    <body>
-                        About to sleep now. The ULP chip should blink the LED {} times and then wake me up. Bye!
-                    </body>
-                </html>
-                "#,
-                cycles).to_owned().into())
-        })
-}
-
-#[cfg(esp32s2)]
-fn start_ulp(cycles: u32) -> Result<()> {
-    use esp_idf_hal::ulp;
-
-    unsafe {
-        esp!(esp_idf_sys::ulp_riscv_load_binary(
-            ULP.as_ptr(),
-            ULP.len() as _
-        ))?;
-        info!("RiscV ULP binary loaded successfully");
-
-        // Once started, the ULP will wakeup every 5 minutes
-        // TODO: Figure out how to disable ULP timer-based wakeup completely, with an ESP-IDF call
-        ulp::enable_timer(false);
-
-        info!("RiscV ULP Timer configured");
-
-        info!(
-            "Default ULP LED blink cycles: {}",
-            core::ptr::read_volatile(CYCLES as *mut u32)
-        );
-
-        core::ptr::write_volatile(CYCLES as *mut u32, cycles);
-        info!(
-            "Sent {} LED blink cycles to the ULP",
-            core::ptr::read_volatile(CYCLES as *mut u32)
-        );
-
-        esp!(esp_idf_sys::ulp_riscv_run())?;
-        info!("RiscV ULP started");
-
-        esp!(esp_idf_sys::esp_sleep_enable_ulp_wakeup())?;
-        info!("Wakeup from ULP enabled");
-
-        // Wake up by a timer in 60 seconds
-        info!("About to get to sleep now. Will wake up automatically either in 1 minute, or once the ULP has done blinking the LED");
-        esp_idf_sys::esp_deep_sleep(Duration::from_secs(60).as_micros() as u64);
-    }
-
-    Ok(())
 }
 
 fn wifi() -> Result<Box<EspWifi>> {
@@ -566,42 +311,6 @@ fn wifi() -> Result<Box<EspWifi>> {
     }
 
     Ok(wifi)
-}
-
-#[cfg(esp_idf_config_lwip_ipv4_napt)]
-fn test_napt(wifi: &mut EspWifi) -> Result<()> {
-    wifi.with_router_netif_mut(|netif| netif.unwrap().enable_napt(true));
-
-    info!("NAPT enabled on the WiFi SoftAP!");
-
-    Ok(())
-}
-
-// Kaluga needs customized screen orientation commands
-// (not a surprise; quite a few ILI9341 boards need these as evidences in the TFT_eSPI & lvgl ESP32 C drivers)
-pub enum KalugaOrientation {
-    Portrait,
-    PortraitFlipped,
-    Landscape,
-    LandscapeFlipped,
-}
-
-impl ili9341::Mode for KalugaOrientation {
-    fn mode(&self) -> u8 {
-        match self {
-            Self::Portrait => 0,
-            Self::Landscape => 0x20 | 0x40,
-            Self::PortraitFlipped => 0x80 | 0x40,
-            Self::LandscapeFlipped => 0x80 | 0x20,
-        }
-    }
-
-    fn is_landscape(&self) -> bool {
-        match self {
-            Self::Landscape | Self::LandscapeFlipped => true,
-            Self::Portrait | Self::PortraitFlipped => false,
-        }
-    }
 }
 
 pub fn from_cstr(buf: &[u8]) -> std::borrow::Cow<'_, str> {
